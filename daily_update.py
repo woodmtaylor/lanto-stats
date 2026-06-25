@@ -55,6 +55,7 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
 SETTLE_HOURS = 18            # only score trades whose entry is this old
 NO_CHART_GIVEUP_HOURS = 36  # past this, an entry with no chart is marked done
+PRICE_WINDOW_GIVEUP_HOURS = 144  # ~6 days: bars older than the rolling window never arrive
 CHART_LOOKBACK_MIN = 20     # pair an entry with a chart image up to this long before it
 CHART_LOOKAHEAD_MIN = 6     # ...or this long after it
 DISCORD_API = "https://discord.com/api/v10"
@@ -671,7 +672,8 @@ def post_webhook(new_rows, status=""):
     try:
         req = urllib.request.Request(
             WEBHOOK_URL, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "LantoTracker/1.0 (+https://railway.app)"})
         urllib.request.urlopen(req, timeout=30).read()
         log("  webhook posted")
     except Exception as e:
@@ -728,7 +730,12 @@ def run(dry=False):
                 scored_now.append(m["id"])  # processed, no trade (matches the 77 historical)
                 gaveup += 1
         elif kind == "nobars":
-            log(f"  {m['id']} pending price bars — will retry next run")
+            if age_h >= PRICE_WINDOW_GIVEUP_HOURS:
+                scored_now.append(m["id"])  # bars will never arrive (older than window)
+                gaveup += 1
+                log(f"  {m['id']} too old for price window — giving up")
+            else:
+                log(f"  {m['id']} pending price bars — will retry next run")
 
     # 3) persist
     if not dry:
