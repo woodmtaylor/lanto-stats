@@ -170,11 +170,19 @@ def fetch_new_messages(after_id):
         log("  scrape skipped: DISCORD_TOKEN/CHANNEL_ID not set")
         return []
     out, cursor = [], int(after_id)
-    while True:
+    for _ in range(60):                           # hard cap: <=6000 msgs/run
         try:
             batch = discord_get(
                 f"/channels/{CHANNEL_ID}/messages?after={cursor}&limit=100")
         except urllib.error.HTTPError as e:
+            if e.code == 429:                     # rate limited: wait, then retry
+                try:
+                    wait = json.loads(e.read()).get("retry_after", 1.0)
+                except Exception:
+                    wait = 1.0
+                log(f"  rate limited; waiting {wait:.1f}s")
+                time.sleep(min(float(wait) + 0.2, 10))
+                continue                          # retry SAME cursor
             log(f"  Discord HTTP {e.code}: {e.read()[:200]!r}")
             break
         except Exception as e:
@@ -209,7 +217,14 @@ def download_charts(raw_msgs, chart_map, dry):
             full = P(local)
             if not dry and not os.path.exists(full):
                 try:
-                    urllib.request.urlretrieve(att["url"], full)
+                    # Discord CDN 403s the default python-urllib UA -> set one.
+                    dreq = urllib.request.Request(
+                        att["url"],
+                        headers={"User-Agent": "Mozilla/5.0 (LantoTracker/1.0)"})
+                    with urllib.request.urlopen(dreq, timeout=60) as resp:
+                        data = resp.read()
+                    with open(full, "wb") as fh:
+                        fh.write(data)
                     saved += 1
                 except Exception as e:
                     log(f"  chart download failed for {m['id']}: {e}")
