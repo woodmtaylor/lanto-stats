@@ -284,17 +284,47 @@ def find_chart(entry_msg, msgs, idx, chart_map):
 # Outcome text parsing  (RECONSTRUCTED — verify against your conventions)
 # --------------------------------------------------------------------------- #
 R_NUM_RE = re.compile(r"([+-]?(?:\d+\.?\d*|\.\d+))\s*R\b", re.IGNORECASE)
+R_MAX = 30.0  # plausible |R| ceiling; bigger = a misread price/typo, ignore
+
+
+def _r_candidates(text):
+    """All plausible R figures with metadata, best-first. Filters out prices
+    and grouped-number fragments (e.g. '29,302'), and de-prioritizes day-total
+    phrasing ('-2R day')."""
+    text = text.replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")
+    out = []
+    for mo in R_NUM_RE.finditer(text):
+        raw = mo.group(1)
+        # reject if part of a comma-grouped number like 29,302  (preceded by ,digit or digit,)
+        pre = text[max(0, mo.start() - 1)]
+        if pre == "," or (pre.isdigit()):
+            continue
+        # reject cumulative brags: "over 25R", "25R+", "+76RR"
+        ctx_before = text[max(0, mo.start() - 6):mo.start()].lower()
+        ctx_after = text[mo.end():mo.end() + 2]
+        if "over" in ctx_before or ctx_after.startswith("+") or ctx_after.startswith("R"):
+            continue
+        try:
+            val = float(raw.replace(",", "."))
+        except ValueError:
+            continue
+        if abs(val) > R_MAX:          # a price or typo, not an R result
+            continue
+        tail = text[mo.end():mo.end() + 6].lower()
+        is_day = tail.lstrip().startswith("day")   # "-2R day" = day total, deprioritize
+        out.append((is_day, mo.start(), val))
+    # prefer non-day, earliest
+    out.sort(key=lambda x: (x[0], x[1]))
+    return out
 
 
 def parse_realized_r(text):
-    """His stated R. Takes the first clearly-stated R figure. Handles comma
-    decimals ('-0,5R') and bare leading decimals ('.5R' = 0.5R). NOTE: his
-    realized R is often discretionary/contextual ('jabbed w/ 0.5R' means
-    -0.5R); for high fidelity enable the LLM extractor (OUTCOME_LLM=1)."""
-    mo = R_NUM_RE.search(text)
-    if not mo:
-        return None
-    return float(mo.group(1).replace(",", "."))
+    """His stated R (best single figure). Handles comma decimals ('-0,5R') and
+    bare leading decimals ('.5R'). Rejects prices/day-totals. NOTE: sign is
+    often implied by context ('jabbed w/ 0.5R' = -0.5R) and is corrected in
+    classify_outcome; for full fidelity enable OUTCOME_LLM=1."""
+    c = _r_candidates(text)
+    return c[0][2] if c else None
 
 
 def classify_outcome(window_text, tps_present):
@@ -314,8 +344,24 @@ def classify_outcome(window_text, tps_present):
                    "took profit", "tp filled", "tp hit", "hit tp", "tapped tp",
                    "target hit", "hit target", "reached target", "tps hit"))
     stop_hit = any(k in t for k in
-                   ("stopped", "stop hit", "stopped out", "jabbed out",
+                   ("stopped", "stop hit", "stopped out", "jabbed out", "jabbed",
                     "chopped out", "took the loss", "stop out", "stop-out"))
+    breakeven_hit = any(k in t for k in
+                        ("breakeven", "break even", "break-even", "moved to be",
+                         "b/e", "be stop", "risk free", "risk-free"))
+    # broader loss context for SIGN correction only (not for outcome_type)
+    loss_ctx = stop_hit or any(k in t for k in ("papercut", "paper cut"))
+
+    # sign-from-context: a positive number written under loss language is a loss
+    if realized is not None and realized > 0 and loss_ctx and not win_hit:
+        realized = -realized
+
+    # when a win is explicitly signalled, the realized figure is the POSITIVE
+    # one (a re-entry after a small loss states both, e.g. "-0.5R ... +2R smashed")
+    if win_hit:
+        pos = [v for (_, _, v) in _r_candidates(window_text) if v > 0]
+        if pos:
+            realized = max(pos)
 
     def which_tp():
         if "tp3" in t or "third target" in t:
@@ -332,11 +378,11 @@ def classify_outcome(window_text, tps_present):
     if win_hit and (realized is None or realized >= 0):
         return realized, which_tp(), "tp_hit"
 
-    # 2) explicit R number present -> stopped (if loss+stop language) else explicit_r
+    # 2) explicit R number present
     if realized is not None:
-        if realized <= 0 and stop_hit:
-            return realized, "none", "stopped"
-        if realized > 0 and any(k in t for k in ("tp", "target")):
+        if realized < 0 or stop_hit:
+            return realized, "none", "stopped" if stop_hit else "explicit_r"
+        if realized > 0 and any(k in t for k in (" tp", "target")):
             return realized, which_tp(), "tp_hit"
         return realized, "none", "explicit_r"
 
@@ -349,7 +395,7 @@ def classify_outcome(window_text, tps_present):
         return None, which_tp(), "tp_hit"
 
     # 5) breakeven habit phrase as last-resort signal
-    if any(k in t for k in ("breakeven", "break even", "break-even", "moved to be")):
+    if breakeven_hit:
         return None, "none", "breakeven"
 
     return None, "none", "unclear"
@@ -372,15 +418,27 @@ def llm_outcome(window_text):
         return None
     prompt = (
         "You are reading a futures trader's freeform follow-up messages about ONE "
-        "trade he just entered. Report his realized outcome as he describes it.\n"
+        "trade he just entered. Report HIS realized outcome for THIS trade.\n"
         "Return ONLY JSON: {\"realized_R\": number or null, "
         "\"text_tp_hit\": \"none\"|\"tp1\"|\"tp2\"|\"tp3\", "
         "\"outcome_type\": \"tp_hit\"|\"breakeven\"|\"stopped\"|\"explicit_r\"|\"unclear\"}.\n"
-        "Rules: 'jabbed'/'stopped'/'chopped out' = stopped (R is negative even if he "
-        "writes it without a minus). 'smashed'/'full take profit' = tp_hit. "
-        "'breakeven stops' is a routine risk note, not an outcome by itself. "
-        "If he states no result, outcome_type='unclear' and realized_R=null.\n\n"
-        "Messages:\n" + window_text[:1500])
+        "Rules:\n"
+        "- 'jabbed'/'stopped'/'chopped out' = stopped; R is NEGATIVE even if written "
+        "without a minus ('jabbed w/ 0.5R' = -0.5).\n"
+        "- 'smashed'/'full take profit'/'target smashed' = tp_hit; use the stated "
+        "POSITIVE R (e.g. 'loss wiped + 1R profit ... +2R smashed' -> realized_R 2).\n"
+        "- 'papercut' = a small loss, usually -0.5R.\n"
+        "- 'breakeven'/'B/E'/'breakeven stops'/'risk free' with no profit or loss "
+        "stated = breakeven, realized_R null. (He says 'breakeven stops' habitually; "
+        "it is NOT an outcome unless that's how the trade actually ended.)\n"
+        "- IGNORE numbers that are PRICES (e.g. '29,302', '7,641'), POSITION SIZE on "
+        "the entry ('I AM LONG, 0.5R' means he risked 0.5R, not a result), DAY/WEEK "
+        "TOTALS ('-2R day', 'our week: ...'), and CUMULATIVE BRAGS ('over 25R+', "
+        "'+76RR YTD'). None of these are this trade's realized_R.\n"
+        "- Prefer his PERSONAL/discretionary result if he gives both personal and "
+        "'consistency/capped' numbers.\n"
+        "- If he states no result for this trade, outcome_type='unclear', realized_R null.\n\n"
+        "Messages:\n" + window_text[:1800])
     body = json.dumps({
         "model": os.environ.get("MODEL", "claude-opus-4-8"),
         "max_tokens": 200,
@@ -407,19 +465,27 @@ def llm_outcome(window_text):
         return None
 
 
+MERGE_WINDOW_MIN = 35  # a same-direction re-entry within this is the SAME trade
+
+
 def outcome_window_text(entry_msg, msgs, idx):
     """His messages after this entry, up to the SETTLE_HOURS horizon OR the next
-    entry signal (whichever comes first) so an adjacent trade's commentary does
-    not leak into this trade's outcome."""
+    DISTINCT trade (whichever comes first). A same-direction entry signal within
+    MERGE_WINDOW_MIN is treated as a re-entry of the same trade and absorbed, so
+    a split entry ('I AM LONG' posted twice) doesn't truncate the window."""
     et = parse_ts(entry_msg["timestamp"])
     hi = et + timedelta(hours=SETTLE_HOURS)
+    my_dir = entry_direction(entry_msg, msgs, idx)
     chunks = []
     for j in range(idx + 1, len(msgs)):
         t = parse_ts(msgs[j]["timestamp"])
         if t > hi:
             break
         if is_entry(msgs[j]["text"]):
-            break  # next trade begins — stop here
+            same_dir = entry_direction(msgs[j], msgs, j) == my_dir
+            quick = (t - et).total_seconds() <= MERGE_WINDOW_MIN * 60
+            if not (same_dir and quick):
+                break  # a genuinely new/opposite trade begins — stop here
         if msgs[j]["text"].strip():
             chunks.append(msgs[j]["text"])
     return "\n".join(chunks)
@@ -596,13 +662,22 @@ def run(dry=False):
     now = datetime.now(timezone.utc)
     bars_cache = {}
     new_rows, scored_now, gaveup = [], [], 0
+    last_entry = None  # (ts, direction) of the most recently handled entry
 
     for idx, m in enumerate(msgs):
         if m["id"] in scored or not is_entry(m["text"]):
             continue
-        age_h = (now - parse_ts(m["timestamp"]).astimezone(timezone.utc)).total_seconds() / 3600
+        et = parse_ts(m["timestamp"]).astimezone(timezone.utc)
+        age_h = (now - et).total_seconds() / 3600
         if age_h < SETTLE_HOURS:
             continue
+        mdir = entry_direction(m, msgs, idx)
+        if last_entry and last_entry[1] == mdir and \
+                (et - last_entry[0]).total_seconds() <= MERGE_WINDOW_MIN * 60:
+            scored_now.append(m["id"])   # re-entry of the prior trade: don't double-count
+            last_entry = (et, mdir)
+            continue
+        last_entry = (et, mdir)
         kind, row = score_entry(m, msgs, idx, chart_map, bars_cache, dry)
         if kind == "trade":
             new_rows.append(row)
