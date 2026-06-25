@@ -82,6 +82,11 @@ def main():
     if run("fetch_prices.py") != 0:
         log("WARNING: price fetch failed; trades lacking bars will retry next run")
     run("daily_update.py")
+    # Aggregate analytics report on a cadence (default: Sundays). Override with
+    # ANALYTICS_DOW (0=Mon..6=Sun) or ANALYTICS_EVERY_RUN=1.
+    dow = int(os.environ.get("ANALYTICS_DOW", "6"))
+    if os.environ.get("ANALYTICS_EVERY_RUN") == "1" or datetime.now(timezone.utc).weekday() == dow:
+        run("analytics.py")
     log("=== pipeline done ===")
 
 
