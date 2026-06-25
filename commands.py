@@ -178,7 +178,7 @@ def cmd_equity(start=None, end=None, instrument=None, direction=None,
 
 
 def cmd_trades(start=None, end=None, instrument=None, direction=None,
-               limit=15, as_csv=False):
+               limit=15, as_csv=False, series="tp1,his"):
     rows = filter_rows(load_rows(), start, end, instrument, direction)
     if not rows:
         return f"No trades in {_range_label(start, end)}.", []
@@ -189,14 +189,19 @@ def cmd_trades(start=None, end=None, instrument=None, direction=None,
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader(); w.writerows(rows)
         return f"{len(rows)} trades in {_range_label(start, end)} (CSV attached).", [path]
+
+    cols = _series_cols(series)
+    short = {"R_tp1_full_net": "TP1", "R_tp2_full_net": "TP2",
+             "R_tp1half_tp2_net": "TP½", "R_trail_net": "trl", "realized_R": "his"}
     shown = rows[-limit:]
-    lines = [f"{'date':<11}{'sym':<4}{'dir':<6}{'TP1':>7}{'his':>7}  outcome"]
+    header = f"{'date':<11}{'sym':<4}{'dir':<6}" + "".join(f"{short[c]:>7}" for c in cols) + "  outcome"
+    lines = [header]
     for r in shown:
         def g(k):
             v = r.get(k, "")
             return f"{float(v):+.2f}" if v not in ("", None) else "—"
         lines.append(f"{r.get('entry_ts','')[:10]:<11}{r.get('instrument','?'):<4}"
-                     f"{r.get('direction','?'):<6}{g('R_tp1_full_net'):>7}{g('realized_R'):>7}"
+                     f"{r.get('direction','?'):<6}" + "".join(f"{g(c):>7}" for c in cols) +
                      f"  {r.get('outcome_type','?')}")
     head = f"**Trades — last {len(shown)} of {len(rows)} in {_range_label(start, end)}**"
     return head + "\n```\n" + "\n".join(lines) + "\n```", []
