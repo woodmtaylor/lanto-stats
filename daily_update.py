@@ -1,0 +1,657 @@
+"""
+daily_update.py — incremental scrape / score / append / alert.
+
+Runs each day from run_pipeline.py with cwd = DATA_DIR (the Railway Volume).
+Sibling modules (price_engine, simulate, vision_parse) live next to this file
+in /app and import normally; all *data* files live in DATA_DIR.
+
+Flow:
+  1. Scrape new Discord messages after state['last_message_id'] (bot token),
+     download image attachments, append messages to messages_master.jsonl,
+     record chart paths in chart_map.json, advance the cursor.
+  2. Find entry signals among ALL messages that are not yet in scored_ids and
+     that settled >= SETTLE_HOURS ago. (Unscored entries naturally retry until
+     their price bars exist — see the price-bars skip below.)
+  3. For each: pair with its chart -> vision_parse levels -> simulate four
+     exits -> subtract the per-trade cost (R, net) -> parse follow-up text for
+     his stated outcome -> append a row to trades_master.csv. Mark the msg_id
+     scored either way (a charted+scored trade, or a processed-but-no-trade
+     entry), matching the original "scored_ids = processed" convention.
+  4. Write stats_summary.txt and (if WEBHOOK_URL set) post a short alert.
+
+Idempotent: a msg_id is processed at most once (scored_ids). A trade whose
+price bars are not yet available is skipped WITHOUT being marked scored, so it
+is retried on the next run.
+
+CLI:
+  python daily_update.py            # normal run
+  python daily_update.py --dry-run  # do everything except write files / post
+  python daily_update.py --selftest # offline: re-score the newest existing
+                                     # trade from the masters to validate the
+                                     # simulate+cost+text pipeline (no Discord)
+"""
+
+import os
+import sys
+import re
+import csv
+import json
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
+
+import price_engine as pe
+import simulate as sim
+import vision_parse as vp
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+DATA = os.environ.get("DATA_DIR") or os.getcwd()
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+
+SETTLE_HOURS = 18            # only score trades whose entry is this old
+NO_CHART_GIVEUP_HOURS = 36  # past this, an entry with no chart is marked done
+CHART_LOOKBACK_MIN = 20     # pair an entry with a chart image up to this long before it
+CHART_LOOKAHEAD_MIN = 6     # ...or this long after it
+DISCORD_API = "https://discord.com/api/v10"
+
+# Cost model — VERIFIED against trades_master.csv: net = gross - costR, where
+# costR = (slippage_pts * point_value + commission) / (risk_pts * point_value).
+COST = {"ES": (0.5, 4.0), "NQ": (7.0, 2.0)}  # (slippage_points, commission_$)
+POINT_VALUE = {"ES": 50.0, "NQ": 20.0}
+
+STRAT_KEYS = ["tp1_full", "tp2_full", "tp1half_tp2", "trail"]
+CSV_COLUMNS = [
+    "entry_ts", "msg_id", "instrument", "direction", "entry", "stop",
+    "tp1", "tp2", "tp3",
+    "R_tp1_full_net", "R_tp2_full_net", "R_tp1half_tp2_net", "R_trail_net",
+    "realized_R", "text_tp_hit", "outcome_type", "vis_conf", "chart_date",
+]
+
+# Entry-signal patterns: "I am long/short", "Im long/short", "I'm long/short".
+ENTRY_RE = re.compile(r"\b(?:i\s*am|i['’`]?m)\s+(long|short)\b", re.IGNORECASE)
+THUMB = "\U0001f44d"  # 👍 lone thumbs-up = entry, direction from prior context
+
+
+def P(name):
+    return os.path.join(DATA, name)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# State / masters I/O
+# --------------------------------------------------------------------------- #
+def load_state():
+    try:
+        s = json.load(open(P("state.json"), encoding="utf-8"))
+    except FileNotFoundError:
+        s = {}
+    s.setdefault("last_message_id", 0)
+    s.setdefault("scored_ids", [])
+    return s
+
+
+def save_state(state):
+    json.dump(state, open(P("state.json"), "w", encoding="utf-8"))
+
+
+def load_messages():
+    msgs = []
+    try:
+        with open(P("messages_master.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    msgs.append(json.loads(line))
+    except FileNotFoundError:
+        pass
+    msgs.sort(key=lambda m: m["timestamp"])
+    return msgs
+
+
+def append_messages(new_msgs):
+    with open(P("messages_master.jsonl"), "a", encoding="utf-8") as f:
+        for m in new_msgs:
+            f.write(json.dumps({"id": m["id"],
+                                "timestamp": m["timestamp"],
+                                "text": m["text"]}) + "\n")
+
+
+def load_chart_map():
+    try:
+        return json.load(open(P("chart_map.json"), encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_chart_map(cm):
+    json.dump(cm, open(P("chart_map.json"), "w", encoding="utf-8"))
+
+
+def trades_count():
+    try:
+        with open(P("trades_master.csv"), encoding="utf-8") as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except FileNotFoundError:
+        return 0
+
+
+def append_trade_row(row):
+    exists = os.path.exists(P("trades_master.csv"))
+    with open(P("trades_master.csv"), "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
+
+
+# --------------------------------------------------------------------------- #
+# Discord scrape  (only this section needs network; untested offline)
+# --------------------------------------------------------------------------- #
+def discord_get(path):
+    req = urllib.request.Request(
+        DISCORD_API + path,
+        headers={"Authorization": f"Bot {DISCORD_TOKEN}",
+                 "User-Agent": "LantoTracker (https://example, 1.0)"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def fetch_new_messages(after_id):
+    """Return raw Discord messages with id > after_id, ascending."""
+    if not (DISCORD_TOKEN and CHANNEL_ID):
+        log("  scrape skipped: DISCORD_TOKEN/CHANNEL_ID not set")
+        return []
+    out, cursor = [], int(after_id)
+    while True:
+        try:
+            batch = discord_get(
+                f"/channels/{CHANNEL_ID}/messages?after={cursor}&limit=100")
+        except urllib.error.HTTPError as e:
+            log(f"  Discord HTTP {e.code}: {e.read()[:200]!r}")
+            break
+        except Exception as e:
+            log(f"  Discord error: {e}")
+            break
+        if not batch:
+            break
+        batch.sort(key=lambda m: int(m["id"]))    # API returns newest-first
+        for m in batch:
+            m["text"] = m.get("content", "") or ""  # Discord uses 'content'
+        out.extend(batch)
+        cursor = int(batch[-1]["id"])             # advance past newest seen
+        if len(batch) < 100:
+            break
+        time.sleep(0.4)                            # be polite to the API
+    return out
+
+
+def download_charts(raw_msgs, chart_map, dry):
+    """Save image attachments under DATA/charts and record msg_id -> path."""
+    os.makedirs(P("charts"), exist_ok=True)
+    saved = 0
+    for m in raw_msgs:
+        for att in m.get("attachments", []) or []:
+            ct = (att.get("content_type") or "")
+            fn = att.get("filename", "")
+            if not (ct.startswith("image/") or
+                    fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):
+                continue
+            ext = (fn.rsplit(".", 1)[-1] if "." in fn else "png").lower()
+            local = os.path.join("charts", f"{m['id']}.{ext}")
+            full = P(local)
+            if not dry and not os.path.exists(full):
+                try:
+                    urllib.request.urlretrieve(att["url"], full)
+                    saved += 1
+                except Exception as e:
+                    log(f"  chart download failed for {m['id']}: {e}")
+                    continue
+            chart_map[m["id"]] = local
+            break  # one chart per message is enough
+    if saved:
+        log(f"  downloaded {saved} new chart image(s)")
+    return chart_map
+
+
+# --------------------------------------------------------------------------- #
+# Entry detection + chart pairing
+# --------------------------------------------------------------------------- #
+def parse_ts(s):
+    return datetime.fromisoformat(s)
+
+
+def entry_direction(msg, msgs, idx):
+    """Direction from this message's text, else from prior context (for 👍)."""
+    mo = ENTRY_RE.search(msg["text"])
+    if mo:
+        return mo.group(1).lower()
+    for j in range(idx - 1, max(-1, idx - 8), -1):
+        mo = ENTRY_RE.search(msgs[j]["text"])
+        if mo:
+            return mo.group(1).lower()
+    return None
+
+
+def is_entry(text):
+    return bool(ENTRY_RE.search(text)) or (THUMB in text and len(text.strip()) <= 3)
+
+
+def find_chart(entry_msg, msgs, idx, chart_map):
+    """Closest chart image within the look-back/ahead window around the entry."""
+    if entry_msg["id"] in chart_map:
+        return chart_map[entry_msg["id"]]
+    et = parse_ts(entry_msg["timestamp"])
+    best, best_gap = None, None
+    lo = et - timedelta(minutes=CHART_LOOKBACK_MIN)
+    hi = et + timedelta(minutes=CHART_LOOKAHEAD_MIN)
+    for j in range(max(0, idx - 12), min(len(msgs), idx + 12)):
+        mid = msgs[j]["id"]
+        if mid not in chart_map:
+            continue
+        t = parse_ts(msgs[j]["timestamp"])
+        if not (lo <= t <= hi):
+            continue
+        gap = abs((t - et).total_seconds())
+        if best_gap is None or gap < best_gap:
+            best, best_gap = chart_map[mid], gap
+    return best
+
+
+# --------------------------------------------------------------------------- #
+# Outcome text parsing  (RECONSTRUCTED — verify against your conventions)
+# --------------------------------------------------------------------------- #
+R_NUM_RE = re.compile(r"([+-]?(?:\d+\.?\d*|\.\d+))\s*R\b", re.IGNORECASE)
+
+
+def parse_realized_r(text):
+    """His stated R. Takes the first clearly-stated R figure. Handles comma
+    decimals ('-0,5R') and bare leading decimals ('.5R' = 0.5R). NOTE: his
+    realized R is often discretionary/contextual ('jabbed w/ 0.5R' means
+    -0.5R); for high fidelity enable the LLM extractor (OUTCOME_LLM=1)."""
+    mo = R_NUM_RE.search(text)
+    if not mo:
+        return None
+    return float(mo.group(1).replace(",", "."))
+
+
+def classify_outcome(window_text, tps_present):
+    """
+    Return (realized_R, text_tp_hit, outcome_type) from the follow-up text.
+
+    Corpus-informed (see notes): he writes "breakeven stops" as a habitual
+    risk note in ~half of ALL outcomes, so it is only a LOW-priority fallback.
+    The strong win signal is "smashed"; stops are hardest and lean on an
+    explicit negative R or stop-out language.
+    """
+    t = window_text.lower()
+    realized = parse_realized_r(window_text)
+
+    win_hit = any(k in t for k in
+                  ("smashed", "full take profit", "full tp", "all out",
+                   "took profit", "tp filled", "tp hit", "hit tp", "tapped tp",
+                   "target hit", "hit target", "reached target", "tps hit"))
+    stop_hit = any(k in t for k in
+                   ("stopped", "stop hit", "stopped out", "jabbed out",
+                    "chopped out", "took the loss", "stop out", "stop-out"))
+
+    def which_tp():
+        if "tp3" in t or "third target" in t:
+            return "tp3"
+        if "tp2" in t or "second target" in t:
+            return "tp2"
+        if "tp1" in t or "first target" in t:
+            return "tp1"
+        if any(k in t for k in ("full take profit", "full tp", "all out", "smashed")):
+            return "tp3" if tps_present >= 3 else ("tp2" if tps_present >= 2 else "tp1")
+        return "tp1"
+
+    # 1) explicit win language -> tp_hit
+    if win_hit and (realized is None or realized >= 0):
+        return realized, which_tp(), "tp_hit"
+
+    # 2) explicit R number present -> stopped (if loss+stop language) else explicit_r
+    if realized is not None:
+        if realized <= 0 and stop_hit:
+            return realized, "none", "stopped"
+        if realized > 0 and any(k in t for k in ("tp", "target")):
+            return realized, which_tp(), "tp_hit"
+        return realized, "none", "explicit_r"
+
+    # 3) stop-out language without a number
+    if stop_hit:
+        return None, "none", "stopped"
+
+    # 4) generic target language without an explicit hit word
+    if any(k in t for k in ("hit tp", "target reached", "took profit")):
+        return None, which_tp(), "tp_hit"
+
+    # 5) breakeven habit phrase as last-resort signal
+    if any(k in t for k in ("breakeven", "break even", "break-even", "moved to be")):
+        return None, "none", "breakeven"
+
+    return None, "none", "unclear"
+
+
+def llm_outcome(window_text):
+    """
+    OPTIONAL high-fidelity outcome extraction (OUTCOME_LLM=1). Uses the same
+    Anthropic key/model as vision_parse to read his freeform follow-up text and
+    return his discretionary result. Far better than regex on phrasing like
+    'jabbed w/ 0.5R' (=-0.5R) or revised day-totals. Falls back to regex on any
+    error so a live run never breaks because of this.
+
+    Returns (realized_R|None, text_tp_hit, outcome_type) or None to signal
+    'use the regex classifier instead'.
+    """
+    if os.environ.get("OUTCOME_LLM") != "1" or not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    if not window_text.strip():
+        return None
+    prompt = (
+        "You are reading a futures trader's freeform follow-up messages about ONE "
+        "trade he just entered. Report his realized outcome as he describes it.\n"
+        "Return ONLY JSON: {\"realized_R\": number or null, "
+        "\"text_tp_hit\": \"none\"|\"tp1\"|\"tp2\"|\"tp3\", "
+        "\"outcome_type\": \"tp_hit\"|\"breakeven\"|\"stopped\"|\"explicit_r\"|\"unclear\"}.\n"
+        "Rules: 'jabbed'/'stopped'/'chopped out' = stopped (R is negative even if he "
+        "writes it without a minus). 'smashed'/'full take profit' = tp_hit. "
+        "'breakeven stops' is a routine risk note, not an outcome by itself. "
+        "If he states no result, outcome_type='unclear' and realized_R=null.\n\n"
+        "Messages:\n" + window_text[:1500])
+    body = json.dumps({
+        "model": os.environ.get("MODEL", "claude-opus-4-8"),
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"content-type": "application/json",
+                 "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                 "anthropic-version": "2023-06-01"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+        txt = "".join(b.get("text", "") for b in data.get("content", [])
+                      if b.get("type") == "text")
+        txt = re.sub(r"^```json|```$", "", txt.strip(), flags=re.M).strip()
+        o = json.loads(txt)
+        tp = o.get("text_tp_hit") or "none"
+        ot = o.get("outcome_type") or "unclear"
+        rr = o.get("realized_R")
+        return (None if rr is None else float(rr)), tp, ot
+    except Exception as e:
+        log(f"  outcome LLM failed ({e}); using regex")
+        return None
+
+
+def outcome_window_text(entry_msg, msgs, idx):
+    """His messages after this entry, up to the SETTLE_HOURS horizon OR the next
+    entry signal (whichever comes first) so an adjacent trade's commentary does
+    not leak into this trade's outcome."""
+    et = parse_ts(entry_msg["timestamp"])
+    hi = et + timedelta(hours=SETTLE_HOURS)
+    chunks = []
+    for j in range(idx + 1, len(msgs)):
+        t = parse_ts(msgs[j]["timestamp"])
+        if t > hi:
+            break
+        if is_entry(msgs[j]["text"]):
+            break  # next trade begins — stop here
+        if msgs[j]["text"].strip():
+            chunks.append(msgs[j]["text"])
+    return "\n".join(chunks)
+
+
+# --------------------------------------------------------------------------- #
+# Scoring
+# --------------------------------------------------------------------------- #
+def cost_r(instrument, risk_pts):
+    slip, comm = COST[instrument]
+    pv = POINT_VALUE[instrument]
+    return (slip * pv + comm) / (risk_pts * pv)
+
+
+def fmt(x):
+    if x is None or x == "":
+        return ""
+    return f"{x:.3f}" if isinstance(x, float) else str(x)
+
+
+def score_entry(entry_msg, msgs, idx, chart_map, bars_cache, dry):
+    """
+    Returns ("trade", row_dict) | ("nochart", None) | ("nobars", None) | ("skip", None).
+    "nobars" means retry next run (do NOT mark scored). The others are terminal.
+    """
+    chart = find_chart(entry_msg, msgs, idx, chart_map)
+    if not chart:
+        return "nochart", None
+    chart_path = P(chart)
+    if not os.path.exists(chart_path):
+        return "nochart", None
+
+    ctx = entry_msg["text"] + "\n" + outcome_window_text(entry_msg, msgs, idx)[:800]
+    v = vp.read_chart(chart_path, ctx)
+    if not v or v.get("error") or v.get("entry") is None or v.get("stop") is None:
+        log(f"  vision unusable for {entry_msg['id']}: {v.get('error') if v else 'no data'}")
+        return "nochart", None
+
+    instrument = v.get("instrument")
+    if instrument not in ("ES", "NQ"):
+        instrument = "NQ" if float(v["entry"]) > 12000 else "ES"
+    direction = (v.get("direction") or
+                 entry_direction(entry_msg, msgs, idx) or "long")
+    entry = float(v["entry"])
+    stop = float(v["stop"])
+    tp1 = v.get("tp1")
+    tp2 = v.get("tp2")
+    tp3 = v.get("tp3")
+    tps = [tp1, tp2, tp3]
+    risk = abs(entry - stop)
+
+    # price bars for this symbol, from entry forward to settle horizon
+    if instrument not in bars_cache:
+        try:
+            bars_cache[instrument] = pe.load_bars(P(f"{instrument}.csv"), instrument)
+        except FileNotFoundError:
+            bars_cache[instrument] = []
+    bars = bars_cache[instrument]
+    et = parse_ts(entry_msg["timestamp"]).astimezone(timezone.utc)
+    after = pe.window(bars, et, et + timedelta(hours=SETTLE_HOURS))
+    if not after:
+        return "nobars", None  # price data not present yet -> retry next run
+
+    sims = sim.simulate(direction, entry, stop, tps, after)
+
+    if risk > 0:
+        cr = cost_r(instrument, risk)
+        net = {k: (None if sims[k] is None else sims[k] - cr) for k in STRAT_KEYS}
+    else:
+        net = {k: None for k in STRAT_KEYS}  # degenerate (entry==stop)
+
+    wtext = outcome_window_text(entry_msg, msgs, idx)
+    llm = llm_outcome(wtext)
+    if llm is not None:
+        realized, tp_hit, otype = llm
+    else:
+        realized, tp_hit, otype = classify_outcome(
+            wtext, sum(1 for x in tps if x is not None))
+
+    row = {
+        "entry_ts": entry_msg["timestamp"],
+        "msg_id": entry_msg["id"],
+        "instrument": instrument,
+        "direction": direction,
+        "entry": fmt(entry), "stop": fmt(stop),
+        "tp1": fmt(float(tp1)) if tp1 is not None else "",
+        "tp2": fmt(float(tp2)) if tp2 is not None else "",
+        "tp3": fmt(float(tp3)) if tp3 is not None else "",
+        "R_tp1_full_net": fmt(net["tp1_full"]),
+        "R_tp2_full_net": fmt(net["tp2_full"]),
+        "R_tp1half_tp2_net": fmt(net["tp1half_tp2"]),
+        "R_trail_net": fmt(net["trail"]),
+        "realized_R": "" if realized is None else fmt(realized),
+        "text_tp_hit": tp_hit,
+        "outcome_type": otype,
+        "vis_conf": v.get("confidence", "low"),
+        "chart_date": v.get("chart_date") or "",
+    }
+    return "trade", row
+
+
+# --------------------------------------------------------------------------- #
+# Stats summary  (reconstructed format; tune freely)
+# --------------------------------------------------------------------------- #
+def write_stats_summary():
+    try:
+        rows = list(csv.DictReader(open(P("trades_master.csv"), encoding="utf-8")))
+    except FileNotFoundError:
+        return ""
+    lines = [f"Lanto tracker — {datetime.now(timezone.utc):%Y-%m-%d %H:%M}Z",
+             f"trades recorded: {len(rows)}", ""]
+    labels = {"R_tp1_full_net": "TP1 full", "R_tp2_full_net": "TP2 full",
+              "R_tp1half_tp2_net": "TP1 half+TP2", "R_trail_net": "Trailing"}
+    for col, name in labels.items():
+        vals = [float(r[col]) for r in rows if r[col] not in ("", None)]
+        if not vals:
+            continue
+        wins = sum(1 for v in vals if v > 0)
+        lines.append(f"{name:<14} n={len(vals):>3}  win={wins/len(vals)*100:4.0f}%  "
+                     f"net={sum(vals):+6.1f}R  avg={sum(vals)/len(vals):+.3f}R")
+    realized = [float(r["realized_R"]) for r in rows if r["realized_R"] not in ("", None)]
+    if realized:
+        w = sum(1 for v in realized if v > 0)
+        lines += ["", f"his stated R  n={len(realized):>3}  win={w/len(realized)*100:4.0f}%  "
+                      f"net={sum(realized):+6.1f}R  avg={sum(realized)/len(realized):+.3f}R"]
+    text = "\n".join(lines) + "\n"
+    with open(P("stats_summary.txt"), "w", encoding="utf-8") as f:
+        f.write(text)
+    return text
+
+
+def post_webhook(new_rows, summary):
+    if not WEBHOOK_URL:
+        return
+    if new_rows:
+        head = f"**Lanto tracker** — {len(new_rows)} new trade(s) scored"
+        body = "\n".join(
+            f"• {r['entry_ts'][:10]} {r['instrument']} {r['direction']} "
+            f"TP1full {r['R_tp1_full_net'] or 'n/a'}R  ({r['outcome_type']})"
+            for r in new_rows)
+        content = f"{head}\n{body}\n```\n{summary}```"
+    else:
+        content = f"**Lanto tracker** — no new settled trades today\n```\n{summary}```"
+    try:
+        req = urllib.request.Request(
+            WEBHOOK_URL, data=json.dumps({"content": content[:1900]}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=30).read()
+        log("  webhook posted")
+    except Exception as e:
+        log(f"  webhook failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def run(dry=False):
+    state = load_state()
+    scored = set(state["scored_ids"])
+    chart_map = load_chart_map()
+
+    # 1) scrape
+    raw = fetch_new_messages(state["last_message_id"])
+    if raw:
+        log(f"  fetched {len(raw)} new message(s)")
+        chart_map = download_charts(raw, chart_map, dry)
+        if not dry:
+            append_messages(raw)
+            state["last_message_id"] = max(int(m["id"]) for m in raw)
+            save_chart_map(chart_map)
+
+    # 2) candidate entries from the full corpus, not yet processed
+    msgs = load_messages()
+    now = datetime.now(timezone.utc)
+    bars_cache = {}
+    new_rows, scored_now, gaveup = [], [], 0
+
+    for idx, m in enumerate(msgs):
+        if m["id"] in scored or not is_entry(m["text"]):
+            continue
+        age_h = (now - parse_ts(m["timestamp"]).astimezone(timezone.utc)).total_seconds() / 3600
+        if age_h < SETTLE_HOURS:
+            continue
+        kind, row = score_entry(m, msgs, idx, chart_map, bars_cache, dry)
+        if kind == "trade":
+            new_rows.append(row)
+            scored_now.append(m["id"])
+            log(f"  scored {m['id']}  {row['instrument']} {row['direction']}  "
+                f"TP1full {row['R_tp1_full_net']}R  ({row['outcome_type']})")
+        elif kind == "nochart":
+            if age_h >= NO_CHART_GIVEUP_HOURS:
+                scored_now.append(m["id"])  # processed, no trade (matches the 77 historical)
+                gaveup += 1
+        elif kind == "nobars":
+            log(f"  {m['id']} pending price bars — will retry next run")
+
+    # 3) persist
+    if not dry:
+        for r in new_rows:
+            append_trade_row(r)
+        scored.update(scored_now)
+        state["scored_ids"] = sorted(scored, key=int)
+        save_state(state)
+
+    summary = write_stats_summary() if not dry else "(dry-run: stats not written)"
+    log(f"  new trades: {len(new_rows)} | newly processed: {len(scored_now)} "
+        f"(of which no-chart give-ups: {gaveup})")
+    if not dry:
+        post_webhook(new_rows, summary)
+    log("daily_update complete")
+    return new_rows
+
+
+def selftest():
+    """Offline: re-score the newest existing trade from the masters and compare
+    the mechanical R columns. Exercises simulate + cost + text parsing without
+    touching Discord or writing anything."""
+    msgs = load_messages()
+    by_id = {m["id"]: i for i, m in enumerate(msgs)}
+    trades = list(csv.DictReader(open(P("trades_master.csv"), encoding="utf-8")))
+    cm = load_chart_map()  # historical charts likely absent -> we test text+cost math only
+    log("self-test: cost model + text classifier on the 3 newest trades")
+    for tr in trades[-3:]:
+        # cost-model check (independent of vision)
+        try:
+            entry, stop = float(tr["entry"]), float(tr["stop"])
+            instrument = tr["instrument"]
+            risk = abs(entry - stop)
+            cr = cost_r(instrument, risk) if risk else 0.0
+            log(f"  {tr['msg_id']} {instrument} risk={risk:g}pts  costR={cr:.3f}  "
+                f"(stored TP1full={tr['R_tp1_full_net']})")
+        except Exception as e:
+            log(f"  {tr['msg_id']}: {e}")
+        # text classifier check
+        i = by_id.get(tr["msg_id"])
+        if i is not None:
+            wt = outcome_window_text(msgs[i], msgs, i)
+            tps_present = sum(1 for k in ("tp1", "tp2", "tp3") if tr[k])
+            r, tp, ot = classify_outcome(wt, tps_present)
+            mark = "OK" if ot == tr["outcome_type"] else "DIFFERS"
+            log(f"      classifier -> {ot}/{tp}/realized={r}  | stored "
+                f"{tr['outcome_type']}/{tr['text_tp_hit']}/{tr['realized_R']}  [{mark}]")
+    log("self-test done (mechanical R math is exact; text labels are best-effort)")
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        selftest()
+    else:
+        run(dry="--dry-run" in sys.argv)
