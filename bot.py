@@ -14,6 +14,7 @@ Env:
   DATA_DIR        volume path (default /data)
 """
 import os, sys, asyncio, subprocess, datetime as dt
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -21,9 +22,11 @@ from discord.ext import tasks
 
 import commands as C
 
+CENTRAL = ZoneInfo("America/Chicago")
 GUILD_ID = int(os.environ.get("GUILD_ID", "0"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-SCHEDULE_HOUR = int(os.environ.get("SCHEDULE_HOUR", "12"))
+SCHEDULE_HOUR = int(os.environ.get("SCHEDULE_HOUR", "16"))   # Central time
+SCHEDULE_MIN = int(os.environ.get("SCHEDULE_MIN", "15"))
 APP = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DATA_DIR", "/data")
 
@@ -132,7 +135,7 @@ def _run_pipeline():
                           cwd=DATA).returncode
 
 
-@tasks.loop(time=dt.time(hour=SCHEDULE_HOUR, minute=0, tzinfo=dt.timezone.utc))
+@tasks.loop(time=dt.time(hour=SCHEDULE_HOUR, minute=SCHEDULE_MIN, tzinfo=CENTRAL))
 async def daily_job():
     print("daily_job: running pipeline", flush=True)
     await asyncio.to_thread(_run_pipeline)
@@ -148,8 +151,8 @@ async def on_ready():
         await tree.sync()
     if not daily_job.is_running():
         daily_job.start()
-    print(f"logged in as {client.user}; commands synced; daily job at {SCHEDULE_HOUR}:00 UTC",
-          flush=True)
+    print(f"logged in as {client.user}; commands synced; "
+          f"daily job at {SCHEDULE_HOUR:02d}:{SCHEDULE_MIN:02d} Central", flush=True)
 
 
 def main():
