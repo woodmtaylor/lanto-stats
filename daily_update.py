@@ -593,6 +593,22 @@ def score_entry(entry_msg, msgs, idx, chart_map, bars_cache, dry):
 # --------------------------------------------------------------------------- #
 # Stats summary  (reconstructed format; tune freely)
 # --------------------------------------------------------------------------- #
+def _strategy_stats(rows):
+    """Return [(label, n, win%, net_R, avg_R), ...] for the four strategies plus
+    his stated R. Shared by the text summary and the Discord embed."""
+    out = []
+    labels = [("R_tp1_full_net", "TP1 full"), ("R_tp2_full_net", "TP2 full"),
+              ("R_tp1half_tp2_net", "TP1½+TP2"), ("R_trail_net", "Trailing"),
+              ("realized_R", "His realized")]
+    for col, name in labels:
+        vals = [float(r[col]) for r in rows if r.get(col) not in ("", None)]
+        if not vals:
+            continue
+        wins = sum(1 for v in vals if v > 0)
+        out.append((name, len(vals), wins / len(vals) * 100, sum(vals), sum(vals) / len(vals)))
+    return out
+
+
 def write_stats_summary():
     try:
         rows = list(csv.DictReader(open(P("trades_master.csv"), encoding="utf-8")))
@@ -600,41 +616,61 @@ def write_stats_summary():
         return ""
     lines = [f"Lanto tracker — {datetime.now(timezone.utc):%Y-%m-%d %H:%M}Z",
              f"trades recorded: {len(rows)}", ""]
-    labels = {"R_tp1_full_net": "TP1 full", "R_tp2_full_net": "TP2 full",
-              "R_tp1half_tp2_net": "TP1 half+TP2", "R_trail_net": "Trailing"}
-    for col, name in labels.items():
-        vals = [float(r[col]) for r in rows if r[col] not in ("", None)]
-        if not vals:
-            continue
-        wins = sum(1 for v in vals if v > 0)
-        lines.append(f"{name:<14} n={len(vals):>3}  win={wins/len(vals)*100:4.0f}%  "
-                     f"net={sum(vals):+6.1f}R  avg={sum(vals)/len(vals):+.3f}R")
-    realized = [float(r["realized_R"]) for r in rows if r["realized_R"] not in ("", None)]
-    if realized:
-        w = sum(1 for v in realized if v > 0)
-        lines += ["", f"his stated R  n={len(realized):>3}  win={w/len(realized)*100:4.0f}%  "
-                      f"net={sum(realized):+6.1f}R  avg={sum(realized)/len(realized):+.3f}R"]
+    for name, n, win, net, avg in _strategy_stats(rows):
+        lines.append(f"{name:<13} n={n:>3}  win={win:4.0f}%  net={net:+6.1f}R  avg={avg:+.3f}R")
     text = "\n".join(lines) + "\n"
     with open(P("stats_summary.txt"), "w", encoding="utf-8") as f:
         f.write(text)
     return text
 
 
-def post_webhook(new_rows, summary):
+def _fmt_trade_line(r):
+    """One compact line per new trade for the Discord report."""
+    def g(k):
+        v = r.get(k, "")
+        return f"{float(v):+.2f}" if v not in ("", None) else "—"
+    instr = r.get("instrument", "?")
+    direction = r.get("direction", "?")
+    his = r.get("realized_R", "")
+    his_s = f" · his {float(his):+.2f}R" if his not in ("", None) else ""
+    return (f"`{r.get('entry_ts','')[:10]}` **{instr} {direction}** · "
+            f"TP1 {g('R_tp1_full_net')} / TP2 {g('R_tp2_full_net')} / "
+            f"trail {g('R_trail_net')}{his_s} · _{r.get('outcome_type','?')}_")
+
+
+def post_webhook(new_rows, status=""):
     if not WEBHOOK_URL:
         return
+    try:
+        rows = list(csv.DictReader(open(P("trades_master.csv"), encoding="utf-8")))
+    except FileNotFoundError:
+        rows = []
+
+    # color: green if the day's new trades net positive, red if negative, gray if none
+    day_net = sum(float(r["realized_R"]) for r in new_rows
+                  if r.get("realized_R") not in ("", None))
+    color = 0x9aa0a6 if not new_rows else (0x2ecc71 if day_net >= 0 else 0xe74c3c)
+
     if new_rows:
-        head = f"**Lanto tracker** — {len(new_rows)} new trade(s) scored"
-        body = "\n".join(
-            f"• {r['entry_ts'][:10]} {r['instrument']} {r['direction']} "
-            f"TP1full {r['R_tp1_full_net'] or 'n/a'}R  ({r['outcome_type']})"
-            for r in new_rows)
-        content = f"{head}\n{body}\n```\n{summary}```"
+        desc = "\n".join(_fmt_trade_line(r) for r in new_rows[:12])
+        title = f"📊 Lanto Tracker — {len(new_rows)} new trade(s)"
     else:
-        content = f"**Lanto tracker** — no new settled trades today\n```\n{summary}```"
+        desc = "No new settled trades today."
+        title = "📊 Lanto Tracker — quiet day"
+
+    stat_lines = [f"{name:<13} n={n:>3}  win {win:3.0f}%  net {net:+6.1f}R"
+                  for name, n, win, net, avg in _strategy_stats(rows)]
+    fields = [{"name": "Mechanical strategies + his realized (net of costs)",
+               "value": "```" + "\n".join(stat_lines) + "```", "inline": False}]
+
+    embed = {"title": title, "description": desc[:4000], "color": color,
+             "fields": fields,
+             "footer": {"text": status or f"{len(rows)} trades on record"},
+             "timestamp": datetime.now(timezone.utc).isoformat()}
+    payload = {"username": "Lanto Tracker", "embeds": [embed]}
     try:
         req = urllib.request.Request(
-            WEBHOOK_URL, data=json.dumps({"content": content[:1900]}).encode(),
+            WEBHOOK_URL, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=30).read()
         log("  webhook posted")
@@ -703,10 +739,12 @@ def run(dry=False):
         save_state(state)
 
     summary = write_stats_summary() if not dry else "(dry-run: stats not written)"
+    status = (f"cursor {state['last_message_id']} · {trades_count()} trades · "
+              f"{len(scored)} processed")
     log(f"  new trades: {len(new_rows)} | newly processed: {len(scored_now)} "
         f"(of which no-chart give-ups: {gaveup})")
     if not dry:
-        post_webhook(new_rows, summary)
+        post_webhook(new_rows, status)
     log("daily_update complete")
     return new_rows
 
