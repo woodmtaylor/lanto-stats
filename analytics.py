@@ -36,11 +36,26 @@ def P(name):
     return os.path.join(DATA, name)
 
 
+def load_corrections():
+    try:
+        return json.load(open(P("corrections.json"), encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def load_rows():
     try:
         rows = list(csv.DictReader(open(P("trades_master.csv"), encoding="utf-8")))
     except FileNotFoundError:
         return []
+    corr = load_corrections()
+    if corr:
+        for r in rows:
+            fix = corr.get(r.get("msg_id"))
+            if fix:
+                for k, v in fix.items():
+                    if not k.startswith("_"):
+                        r[k] = str(v)
     rows.sort(key=lambda r: r.get("entry_ts", ""))
     return rows
 
@@ -151,28 +166,37 @@ def text_report(rows):
 # --------------------------------------------------------------------------- #
 # Charts
 # --------------------------------------------------------------------------- #
-def chart_equity(rows):
+def chart_equity(rows, cols=None, out_name="equity.png",
+                 title="Cumulative R — equity curves", by_date=True):
+    cols = cols or list(STRATS.keys())
     plt.style.use("default")
     fig, ax = plt.subplots(figsize=(11, 5.2), dpi=130)
-    for col, name in STRATS.items():
+    plotted = False
+    for col in cols:
+        name = STRATS.get(col, col)
         s = series(rows, col)
         if not s:
             continue
-        xs = [dt for dt, _ in s]
+        plotted = True
         cum, c = [], 0.0
         for _, v in s:
             c += v; cum.append(c)
+        xs = [dt for dt, _ in s] if by_date else list(range(1, len(s) + 1))
         ax.plot(xs, cum, label=f"{name} ({cum[-1]:+.0f}R)",
-                color=PALETTE[name], lw=2.2 if name == "His realized" else 1.6,
+                color=PALETTE.get(name, "#666"),
+                lw=2.2 if name == "His realized" else 1.6,
                 alpha=0.95 if name == "His realized" else 0.8)
     ax.axhline(0, color="#888", lw=0.8)
-    ax.set_title("Cumulative R — equity curves", fontsize=13, weight="bold")
+    ax.set_title(title, fontsize=13, weight="bold")
     ax.set_ylabel("Cumulative R")
-    ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+    ax.set_xlabel("date" if by_date else "trade #")
+    if plotted:
+        ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
     ax.grid(True, alpha=0.25)
-    fig.autofmt_xdate()
+    if by_date:
+        fig.autofmt_xdate()
     fig.tight_layout()
-    path = P("equity.png")
+    path = P(out_name)
     fig.savefig(path); plt.close(fig)
     return path
 
