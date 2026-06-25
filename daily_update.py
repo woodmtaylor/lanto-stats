@@ -82,6 +82,16 @@ def P(name):
     return os.path.join(DATA, name)
 
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def snowflake_for(dt):
+    """Discord snowflake id for a given UTC datetime (for time-based cursors)."""
+    ms = int(dt.timestamp() * 1000) - 1420070400000  # Discord epoch
+    return max(0, ms) << 22
+
+
 def log(msg):
     print(msg, flush=True)
 
@@ -118,11 +128,30 @@ def load_messages():
 
 
 def append_messages(new_msgs):
-    with open(P("messages_master.jsonl"), "a", encoding="utf-8") as f:
-        for m in new_msgs:
-            f.write(json.dumps({"id": m["id"],
-                                "timestamp": m["timestamp"],
-                                "text": m["text"]}) + "\n")
+    """Update-or-insert messages by id, so a re-scrape can backfill text that an
+    earlier run stored empty (e.g. before embeds were parsed)."""
+    existing = {}
+    try:
+        with open(P("messages_master.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    m = json.loads(line)
+                    existing[m["id"]] = m
+    except FileNotFoundError:
+        pass
+    for m in new_msgs:
+        rec = {"id": m["id"], "timestamp": m["timestamp"], "text": m["text"]}
+        # keep the richer (non-empty) text if a re-scrape now has content
+        if m["id"] in existing and not rec["text"]:
+            rec["text"] = existing[m["id"]].get("text", "")
+        existing[m["id"]] = rec
+    ordered = sorted(existing.values(), key=lambda r: int(r["id"]))
+    tmp = P("messages_master.jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in ordered:
+            f.write(json.dumps(r) + "\n")
+    os.replace(tmp, P("messages_master.jsonl"))
 
 
 def load_chart_map():
@@ -193,7 +222,16 @@ def fetch_new_messages(after_id):
             break
         batch.sort(key=lambda m: int(m["id"]))    # API returns newest-first
         for m in batch:
-            m["text"] = m.get("content", "") or ""  # Discord uses 'content'
+            # Lanto's calls often arrive as forwarded EMBEDS: the real text is in
+            # the embed (title/description/fields), not the plain 'content'.
+            parts = [m.get("content", "") or ""]
+            for e in m.get("embeds", []) or []:
+                parts.append(e.get("title", "") or "")
+                parts.append(e.get("description", "") or "")
+                for fld in e.get("fields", []) or []:
+                    parts.append(fld.get("name", "") or "")
+                    parts.append(fld.get("value", "") or "")
+            m["text"] = "\n".join(p for p in parts if p).strip()
         out.extend(batch)
         cursor = int(batch[-1]["id"])             # advance past newest seen
         if len(batch) < 100:
@@ -202,26 +240,39 @@ def fetch_new_messages(after_id):
     return out
 
 
+def _image_urls(m):
+    """Image URLs on a message: attachments AND embed image/thumbnail."""
+    urls = []
+    for att in m.get("attachments", []) or []:
+        ct = (att.get("content_type") or "")
+        fn = att.get("filename", "")
+        if ct.startswith("image/") or fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            urls.append((att.get("url"), fn))
+    for e in m.get("embeds", []) or []:
+        for key in ("image", "thumbnail"):
+            obj = e.get(key) or {}
+            u = obj.get("url") or obj.get("proxy_url")
+            if u:
+                urls.append((u, u.split("?")[0].rsplit("/", 1)[-1]))
+    return [(u, fn) for (u, fn) in urls if u]
+
+
 def download_charts(raw_msgs, chart_map, dry):
-    """Save image attachments under DATA/charts and record msg_id -> path."""
+    """Save image attachments/embeds under DATA/charts and record msg_id -> path."""
     os.makedirs(P("charts"), exist_ok=True)
     saved = 0
     for m in raw_msgs:
-        for att in m.get("attachments", []) or []:
-            ct = (att.get("content_type") or "")
-            fn = att.get("filename", "")
-            if not (ct.startswith("image/") or
-                    fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):
-                continue
+        for url, fn in _image_urls(m):
             ext = (fn.rsplit(".", 1)[-1] if "." in fn else "png").lower()
+            if ext not in ("png", "jpg", "jpeg", "webp"):
+                ext = "png"
             local = os.path.join("charts", f"{m['id']}.{ext}")
             full = P(local)
             if not dry and not os.path.exists(full):
                 try:
                     # Discord CDN 403s the default python-urllib UA -> set one.
                     dreq = urllib.request.Request(
-                        att["url"],
-                        headers={"User-Agent": "Mozilla/5.0 (LantoTracker/1.0)"})
+                        url, headers={"User-Agent": "Mozilla/5.0 (LantoTracker/1.0)"})
                     with urllib.request.urlopen(dreq, timeout=60) as resp:
                         data = resp.read()
                     with open(full, "wb") as fh:
@@ -688,14 +739,25 @@ def run(dry=False):
     scored = set(state["scored_ids"])
     chart_map = load_chart_map()
 
-    # 1) scrape
-    raw = fetch_new_messages(state["last_message_id"])
+    # 1) scrape. RESCRAPE_DAYS re-fetches a recent window (one-time backfill) so
+    # messages stored before embeds were parsed get their text/charts refreshed.
+    after = state["last_message_id"]
+    rescrape = os.environ.get("RESCRAPE_DAYS")
+    if rescrape:
+        try:
+            cutoff = now_utc() - timedelta(days=float(rescrape))
+            after = min(int(after), snowflake_for(cutoff))
+            log(f"  RESCRAPE_DAYS={rescrape}: re-fetching from {cutoff:%Y-%m-%d}")
+        except ValueError:
+            pass
+    raw = fetch_new_messages(after)
     if raw:
-        log(f"  fetched {len(raw)} new message(s)")
+        log(f"  fetched {len(raw)} message(s)")
         chart_map = download_charts(raw, chart_map, dry)
         if not dry:
             append_messages(raw)
-            state["last_message_id"] = max(int(m["id"]) for m in raw)
+            state["last_message_id"] = max(int(state["last_message_id"]),
+                                           max(int(m["id"]) for m in raw))
             save_chart_map(chart_map)
 
     # 2) candidate entries from the full corpus, not yet processed
