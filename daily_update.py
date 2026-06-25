@@ -40,6 +40,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import price_engine as pe
 import simulate as sim
@@ -84,6 +85,21 @@ def P(name):
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+
+CENTRAL = ZoneInfo("America/Chicago")
+
+
+def settle_time(entry_dt):
+    """When a trade is considered done: the close (16:00 Central) of the session
+    it was entered in. Morning/midday entries settle the SAME day at 4pm CT;
+    entries within 30 min of the close, or overnight, roll to the next close."""
+    e = entry_dt.astimezone(CENTRAL)
+    cutoff = e + timedelta(minutes=30)
+    close = cutoff.replace(hour=16, minute=0, second=0, microsecond=0)
+    if cutoff > close:
+        close = close + timedelta(days=1)
+    return close.astimezone(timezone.utc)
 
 
 def snowflake_for(dt):
@@ -772,8 +788,8 @@ def run(dry=False):
             continue
         et = parse_ts(m["timestamp"]).astimezone(timezone.utc)
         age_h = (now - et).total_seconds() / 3600
-        if age_h < SETTLE_HOURS:
-            continue
+        if now < settle_time(et):
+            continue  # the trade's Central session hasn't closed yet
         mdir = entry_direction(m, msgs, idx)
         if last_entry and last_entry[1] == mdir and \
                 (et - last_entry[0]).total_seconds() <= MERGE_WINDOW_MIN * 60:
