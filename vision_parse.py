@@ -2,21 +2,20 @@
 vision_parse.py — read the drawn levels off one setup chart.
 
 Sends the local chart image + the trade's surrounding messages to the model and
-returns the levels he drew. The chart shows an entry line/zone, a red stop zone,
-and a green target zone; reading the stop is the key number (it sets 1R).
+returns the levels he drew (entry line, red stop zone, green target zone). The
+image is normalized to a clean PNG first, so any format the downloader saved
+(WebP from forwarded embeds, odd extensions, oversized screenshots) still works.
+On failure it returns a SPECIFIC error string so the daily log shows the real
+cause instead of a generic parse error.
 
-Needs ANTHROPIC_API_KEY. Vision accuracy on small axis numbers is good but not
-perfect, so each result includes the chart's printed date (cross-checked against
-the message timestamp) and a confidence flag.
-
-Set MODEL=claude-opus-4-8 for best chart-reading accuracy (recommended for vision).
+Needs ANTHROPIC_API_KEY. MODEL defaults to claude-opus-4-8 (best for vision).
 """
-
-import os, json, re, time, base64
-import urllib.request
+import os, json, re, time, base64, io
+import urllib.request, urllib.error
 
 MODEL = os.environ.get("MODEL", "claude-opus-4-8")
 API_URL = "https://api.anthropic.com/v1/messages"
+MAX_EDGE = 1568  # Anthropic's recommended max long edge
 
 PROMPT = """This is a TradingView screenshot of an ES or NQ futures setup that the trader posted with his entry. Read the levels he has DRAWN on the chart.
 
@@ -33,19 +32,42 @@ Return ONLY a JSON object (no prose, no markdown):
 - chart_date: the date printed on the chart's time axis if visible (e.g. "2026-05-12"), else null
 - confidence: "high" | "medium" | "low" (low if zones/axis are hard to read)
 
+If this image is not a setup chart with drawn zones (e.g. it's a commentary or review screenshot), return {"entry": null, "confidence": "low"}.
+
 The trader's messages around this chart (for context on direction/instrument):
 """
 
 
-def _media_type(path):
-    ext = path.lower().rsplit(".", 1)[-1]
-    return {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "webp": "image/webp"}.get(ext, "image/png")
+def _load_image_b64(path):
+    """Normalize any image to a clean, reasonably sized PNG (handles WebP/JPEG/
+    odd extensions). Raises if the file isn't a decodable image."""
+    from PIL import Image
+    im = Image.open(path)
+    im.load()
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    long_edge = max(im.size)
+    if long_edge > MAX_EDGE:
+        s = MAX_EDGE / long_edge
+        im = im.resize((max(1, int(im.size[0] * s)), max(1, int(im.size[1] * s))))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return base64.standard_b64encode(buf.getvalue()).decode()
+
+
+def _extract_json(txt):
+    txt = txt.strip()
+    txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt, flags=re.S)
+    m = re.search(r"\{.*\}", txt, re.S)  # first JSON object, even if prose-wrapped
+    return json.loads(m.group(0) if m else txt)
 
 
 def read_chart(image_path, context_text):
-    with open(image_path, "rb") as f:
-        b64 = base64.standard_b64encode(f.read()).decode()
+    try:
+        b64 = _load_image_b64(image_path)
+    except Exception as e:
+        return {"error": f"bad image: {e}", "confidence": "low"}
+
     body = json.dumps({
         "model": MODEL,
         "max_tokens": 600,
@@ -53,8 +75,8 @@ def read_chart(image_path, context_text):
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64",
-                 "media_type": _media_type(image_path), "data": b64}},
-                {"type": "text", "text": PROMPT + context_text},
+                 "media_type": "image/png", "data": b64}},
+                {"type": "text", "text": PROMPT + (context_text or "")},
             ],
         }],
     }).encode()
@@ -63,15 +85,37 @@ def read_chart(image_path, context_text):
         headers={"content-type": "application/json",
                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
                  "anthropic-version": "2023-06-01"})
-    for attempt in range(4):
+
+    last = "no response"
+    for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 data = json.loads(r.read())
+            if data.get("type") == "error":
+                last = "api error: " + str(data.get("error", {}).get("message", "?"))[:140]
+                break
             txt = "".join(b.get("text", "") for b in data.get("content", [])
                           if b.get("type") == "text")
-            txt = re.sub(r"^```json|```$", "", txt.strip(), flags=re.M).strip()
-            return json.loads(txt)
+            if not txt.strip():
+                last = f"empty reply (stop={data.get('stop_reason')})"
+                break
+            try:
+                return _extract_json(txt)
+            except Exception:
+                last = "non-JSON reply: " + repr(txt[:140])
+                break  # deterministic; retrying won't help
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read()[:200].decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            last = f"HTTP {e.code}: {detail}"
+            if e.code in (429, 500, 502, 503, 529) and attempt < 2:
+                time.sleep(2 * (attempt + 1)); continue
+            break
         except Exception as e:
-            if attempt == 3:
-                return {"error": str(e), "confidence": "low"}
-            time.sleep(2 * (attempt + 1))
+            last = str(e)
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1)); continue
+            break
+    return {"error": last, "confidence": "low"}
