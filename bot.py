@@ -79,13 +79,15 @@ async def equity(interaction, range: str = "all", series: str = "all",
 
 
 @tree.command(description="List trades in a range (table, or CSV with csv:true)")
-@app_commands.describe(range=RANGE_HELP, instrument="ES / NQ / both", direction="long / short / both",
+@app_commands.describe(range=RANGE_HELP, series="columns: his,tp1,tp2,tp1half,trail (or all)",
+                       instrument="ES / NQ / both", direction="long / short / both",
                        limit="rows to show (table mode)", csv="attach full CSV instead")
 @app_commands.choices(instrument=INSTR, direction=DIRN)
-async def trades(interaction, range: str = "30d", instrument: str = "both",
-                 direction: str = "both", limit: int = 15, csv: bool = False):
+async def trades(interaction, range: str = "30d", series: str = "tp1,his",
+                 instrument: str = "both", direction: str = "both",
+                 limit: int = 15, csv: bool = False):
     s, e = C.parse_range(range)
-    await _go(interaction, C.cmd_trades, s, e, instrument, direction, limit, csv)
+    await _go(interaction, C.cmd_trades, s, e, instrument, direction, limit, csv, series)
 
 
 @tree.command(description="Trades most likely mis-scored (low confidence / unclear)")
