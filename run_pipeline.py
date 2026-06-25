@@ -24,7 +24,7 @@ def log(msg):
 
 def bootstrap():
     os.makedirs(DATA, exist_ok=True)
-    seed = os.path.join(APP, "seed")
+    seed = APP
     for name in ["state.json", "trades_master.csv", "messages_master.jsonl"]:
         dst, src = os.path.join(DATA, name), os.path.join(seed, name)
         if not os.path.exists(dst) and os.path.exists(src):
