@@ -61,11 +61,13 @@ async def status(interaction):
 
 
 @tree.command(description="Performance metrics for a date range / filter")
-@app_commands.describe(range=RANGE_HELP, instrument="ES / NQ / both", direction="long / short / both")
+@app_commands.describe(range=RANGE_HELP, series="strategy: tp1,tp2,tp1half,trail,his (or all). Default tp1",
+                       instrument="ES / NQ / both", direction="long / short / both")
 @app_commands.choices(instrument=INSTR, direction=DIRN)
-async def stats(interaction, range: str = "all", instrument: str = "both", direction: str = "both"):
+async def stats(interaction, range: str = "all", series: str = "tp1",
+                instrument: str = "both", direction: str = "both"):
     s, e = C.parse_range(range)
-    await _go(interaction, C.cmd_stats, s, e, instrument, direction)
+    await _go(interaction, C.cmd_stats, s, e, instrument, direction, series)
 
 
 @tree.command(description="Equity curves (toggle series, filter, x-axis)")
@@ -75,7 +77,7 @@ async def stats(interaction, range: str = "all", instrument: str = "both", direc
 @app_commands.choices(instrument=INSTR, direction=DIRN,
                       x=[app_commands.Choice(name="date", value="date"),
                          app_commands.Choice(name="trade", value="trade")])
-async def equity(interaction, range: str = "all", series: str = "all",
+async def equity(interaction, range: str = "all", series: str = "tp1,tp1half,trail",
                  instrument: str = "both", direction: str = "both", x: str = "date"):
     s, e = C.parse_range(range)
     await _go(interaction, C.cmd_equity, s, e, instrument, direction, series, x == "date")
@@ -86,7 +88,7 @@ async def equity(interaction, range: str = "all", series: str = "all",
                        instrument="ES / NQ / both", direction="long / short / both",
                        limit="rows to show (table mode)", csv="attach full CSV instead")
 @app_commands.choices(instrument=INSTR, direction=DIRN)
-async def trades(interaction, range: str = "30d", series: str = "tp1,his",
+async def trades(interaction, range: str = "30d", series: str = "tp1",
                  instrument: str = "both", direction: str = "both",
                  limit: int = 15, csv: bool = False):
     s, e = C.parse_range(range)
