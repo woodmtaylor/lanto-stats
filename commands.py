@@ -149,12 +149,14 @@ def cmd_status():
     return txt, []
 
 
-def cmd_stats(start=None, end=None, instrument=None, direction=None):
+def cmd_stats(start=None, end=None, instrument=None, direction=None, series="tp1"):
     rows = filter_rows(load_rows(), start, end, instrument, direction)
     if not rows:
         return f"No trades in {_range_label(start, end)}.", []
+    cols = _series_cols(series)
     lines = [f"{'strategy':<13}{'n':>4}{'win%':>6}{'netR':>8}{'avgR':>7}{'PF':>6}{'DD':>7}{'MCW':>4}{'MCL':>4}"]
-    for col, name in A.STRATS.items():
+    for col in cols:
+        name = A.STRATS.get(col, col)
         m = A.metrics([v for _, v in A.series(rows, col)])
         if not m:
             continue
@@ -166,7 +168,7 @@ def cmd_stats(start=None, end=None, instrument=None, direction=None):
 
 
 def cmd_equity(start=None, end=None, instrument=None, direction=None,
-               series="all", by_date=True):
+               series="tp1,tp1half,trail", by_date=True):
     rows = filter_rows(load_rows(), start, end, instrument, direction)
     if not rows:
         return f"No trades in {_range_label(start, end)}.", []
@@ -178,7 +180,7 @@ def cmd_equity(start=None, end=None, instrument=None, direction=None,
 
 
 def cmd_trades(start=None, end=None, instrument=None, direction=None,
-               limit=15, as_csv=False, series="tp1,his"):
+               limit=15, as_csv=False, series="tp1"):
     rows = filter_rows(load_rows(), start, end, instrument, direction)
     if not rows:
         return f"No trades in {_range_label(start, end)}.", []
@@ -298,25 +300,29 @@ def cmd_audit(msg_id=None):
         cmap = json.load(open(P("chart_map.json"), encoding="utf-8"))
     except Exception:
         pass
-    chart = cmap.get(m["id"])
+    idx = next((i for i, x in enumerate(msgs) if x["id"] == m["id"]), None)
+    # use the SAME self-healing pairing the scorer uses (rejects avatars, searches
+    # neighbors), so audit reflects the real chart, not a stale mapping
+    chart = D.find_chart(m, msgs, idx, cmap) if idx is not None else cmap.get(m["id"])
     chart_full = P(chart) if chart else None
     exists = bool(chart_full and os.path.exists(chart_full))
 
     out = [f"**Audit `{m['id']}`**  ({m.get('timestamp','')[:16]})",
            f"detected as entry: {D.is_entry(m.get('text',''))}",
-           f"chart mapped: {chart or '—'}  | file present: {exists}",
+           f"chart used: {chart or '—'}  | file present: {exists}",
            "```", (m.get("text", "")[:300] or "(no text)"), "```"]
 
     files = []
     if exists:
         files = [chart_full]
         try:
-            v = V.read_chart(chart_full, m.get("text", "")[:600])
+            ctx = D.context_around(msgs, idx) if idx is not None else m.get("text", "")
+            v = V.read_chart(chart_full, ctx[:1600])
             out.append("**live vision result:**\n```\n" + json.dumps(v, indent=1)[:700] + "\n```")
         except Exception as e:
             out.append(f"vision raised: {e}")
     else:
-        out.append("_No chart file to read — that's why it didn't score._")
+        out.append("_No chart-like image found near this entry — that's why it didn't score._")
     return "\n".join(out), files
 
 
