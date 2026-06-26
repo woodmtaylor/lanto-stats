@@ -257,36 +257,64 @@ def fetch_new_messages(after_id):
 
 
 def _image_urls(m):
-    """Image URLs on a message: attachments AND embed image/thumbnail."""
+    """Chart-candidate image URLs on a message. Pulls attachments and embed
+    IMAGES (not thumbnails — those are avatars/icons), and digs into forwarded
+    message_snapshots where Lanto's real charts live."""
     urls = []
-    for att in m.get("attachments", []) or []:
-        ct = (att.get("content_type") or "")
-        fn = att.get("filename", "")
-        if ct.startswith("image/") or fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-            urls.append((att.get("url"), fn))
-    for e in m.get("embeds", []) or []:
-        for key in ("image", "thumbnail"):
-            obj = e.get(key) or {}
-            u = obj.get("url") or obj.get("proxy_url")
+
+    def from_obj(obj):
+        for att in obj.get("attachments", []) or []:
+            ct = (att.get("content_type") or "")
+            fn = att.get("filename", "")
+            if ct.startswith("image/") or fn.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                urls.append((att.get("url"), fn))
+        for e in obj.get("embeds", []) or []:
+            img = e.get("image") or {}          # NOT 'thumbnail' (that's the avatar)
+            u = img.get("url") or img.get("proxy_url")
             if u:
                 urls.append((u, u.split("?")[0].rsplit("/", 1)[-1]))
+
+    from_obj(m)
+    for snap in m.get("message_snapshots", []) or []:
+        from_obj(snap.get("message") or {})
     return [(u, fn) for (u, fn) in urls if u]
 
 
+def _chart_dims(path):
+    """(w, h) if the file is a decodable image, else None."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _is_chart_like(path):
+    """A real TradingView chart is large; avatars/icons (e.g. 256x256) are not."""
+    d = _chart_dims(path)
+    return bool(d and min(d) >= 400 and max(d) >= 800)
+
+
 def download_charts(raw_msgs, chart_map, dry):
-    """Save image attachments/embeds under DATA/charts and record msg_id -> path."""
+    """Download candidate images; map each message to its LARGEST chart-like
+    image (filtering out avatar/icon thumbnails)."""
     os.makedirs(P("charts"), exist_ok=True)
     saved = 0
     for m in raw_msgs:
-        for url, fn in _image_urls(m):
+        best, best_area = None, 0
+        for i, (url, fn) in enumerate(_image_urls(m)):
             ext = (fn.rsplit(".", 1)[-1] if "." in fn else "png").lower()
             if ext not in ("png", "jpg", "jpeg", "webp"):
                 ext = "png"
-            local = os.path.join("charts", f"{m['id']}.{ext}")
+            local = os.path.join("charts", f"{m['id']}_{i}.{ext}")
             full = P(local)
-            if not dry and not os.path.exists(full):
+            if dry:
+                if not best:
+                    best = local  # best-effort in dry mode (no dims available)
+                continue
+            if not os.path.exists(full):
                 try:
-                    # Discord CDN 403s the default python-urllib UA -> set one.
                     dreq = urllib.request.Request(
                         url, headers={"User-Agent": "Mozilla/5.0 (LantoTracker/1.0)"})
                     with urllib.request.urlopen(dreq, timeout=60) as resp:
@@ -297,10 +325,15 @@ def download_charts(raw_msgs, chart_map, dry):
                 except Exception as e:
                     log(f"  chart download failed for {m['id']}: {e}")
                     continue
-            chart_map[m["id"]] = local
-            break  # one chart per message is enough
+            d = _chart_dims(full)
+            if d and min(d) >= 400 and max(d) >= 800:   # chart-like, not an avatar
+                area = d[0] * d[1]
+                if area > best_area:
+                    best, best_area = local, area
+        if best:
+            chart_map[m["id"]] = best
     if saved:
-        log(f"  downloaded {saved} new chart image(s)")
+        log(f"  downloaded {saved} new image(s)")
     return chart_map
 
 
@@ -325,6 +358,22 @@ def entry_direction(msg, msgs, idx):
 
 def is_entry(text):
     return bool(ENTRY_RE.search(text)) or (THUMB in text and len(text.strip()) <= 3)
+
+
+def context_around(msgs, idx, before=6):
+    """Context for vision: the few messages BEFORE the entry (where he states the
+    setup levels — 'Target PDL 29,262', 'Breakeven at 5m gap fill 29,464'), the
+    entry line itself, then the immediate follow-ups."""
+    start = max(0, idx - before)
+    pre = [msgs[j]["text"] for j in range(start, idx) if msgs[j].get("text", "").strip()]
+    post = outcome_window_text(msgs[idx], msgs, idx)
+    blocks = []
+    if pre:
+        blocks.append("SETUP CONTEXT (his messages just before entry):\n" + "\n".join(pre[-before:]))
+    blocks.append("ENTRY: " + msgs[idx].get("text", ""))
+    if post.strip():
+        blocks.append("AFTER ENTRY:\n" + post)
+    return "\n\n".join(blocks).strip()
 
 
 def find_chart(entry_msg, msgs, idx, chart_map):
@@ -589,7 +638,7 @@ def score_entry(entry_msg, msgs, idx, chart_map, bars_cache, dry):
     if not os.path.exists(chart_path):
         return "nochart", None
 
-    ctx = entry_msg["text"] + "\n" + outcome_window_text(entry_msg, msgs, idx)[:800]
+    ctx = context_around(msgs, idx)[:1600]
     v = vp.read_chart(chart_path, ctx)
     if not v or v.get("error") or v.get("entry") is None or v.get("stop") is None:
         log(f"  vision unusable for {entry_msg['id']}: {v.get('error') if v else 'no data'}")
