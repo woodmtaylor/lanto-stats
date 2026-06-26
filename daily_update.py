@@ -779,6 +779,32 @@ def run(dry=False):
     # 2) candidate entries from the full corpus, not yet processed
     msgs = load_messages()
     now = datetime.now(timezone.utc)
+
+    # During a RESCRAPE, re-attempt entries we previously marked done WITHOUT
+    # producing a trade (e.g. give-ups from when vision was broken). Only those
+    # in the rescrape window and not already traded, so we don't churn old data.
+    if rescrape and not dry:
+        try:
+            win_start = now_utc() - timedelta(days=float(rescrape))
+            traded = set()
+            try:
+                with open(P("trades_master.csv"), encoding="utf-8") as f:
+                    traded = {r["msg_id"] for r in csv.DictReader(f)}
+            except FileNotFoundError:
+                pass
+            freed = 0
+            for m in msgs:
+                if m["id"] in scored and m["id"] not in traded and is_entry(m["text"]):
+                    try:
+                        if parse_ts(m["timestamp"]).astimezone(timezone.utc) >= win_start:
+                            scored.discard(m["id"]); freed += 1
+                    except (ValueError, KeyError):
+                        pass
+            if freed:
+                log(f"  rescrape: re-attempting {freed} previously-skipped entr(ies)")
+        except ValueError:
+            pass
+
     bars_cache = {}
     new_rows, scored_now, gaveup = [], [], 0
     last_entry = None  # (ts, direction) of the most recently handled entry
