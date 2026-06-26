@@ -57,8 +57,8 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 SETTLE_HOURS = 18            # only score trades whose entry is this old
 NO_CHART_GIVEUP_HOURS = 36  # past this, an entry with no chart is marked done
 PRICE_WINDOW_GIVEUP_HOURS = 144  # ~6 days: bars older than the rolling window never arrive
-CHART_LOOKBACK_MIN = 20     # pair an entry with a chart image up to this long before it
-CHART_LOOKAHEAD_MIN = 6     # ...or this long after it
+CHART_LOOKBACK_MIN = 35     # pair an entry with a chart image up to this long before it
+CHART_LOOKAHEAD_MIN = 20    # ...or this long after it
 DISCORD_API = "https://discord.com/api/v10"
 
 # Cost model — VERIFIED against trades_master.csv: net = gross - costR, where
@@ -377,23 +377,34 @@ def context_around(msgs, idx, before=6):
 
 
 def find_chart(entry_msg, msgs, idx, chart_map):
-    """Closest chart image within the look-back/ahead window around the entry."""
-    if entry_msg["id"] in chart_map:
-        return chart_map[entry_msg["id"]]
+    """Find the real setup chart for an entry. Validates that any mapped image is
+    actually chart-like (rejecting stale avatar mappings), and if the entry has no
+    chart of its own, searches the surrounding messages — his setup chart often
+    sits a few messages before (or after) the bare 'I AM LONG' line."""
+    def chartlike(mid):
+        p = chart_map.get(mid)
+        if not p:
+            return None
+        full = P(p)
+        return p if (os.path.exists(full) and _is_chart_like(full)) else None
+
+    own = chartlike(entry_msg["id"])
+    if own:
+        return own
     et = parse_ts(entry_msg["timestamp"])
-    best, best_gap = None, None
     lo = et - timedelta(minutes=CHART_LOOKBACK_MIN)
     hi = et + timedelta(minutes=CHART_LOOKAHEAD_MIN)
-    for j in range(max(0, idx - 12), min(len(msgs), idx + 12)):
-        mid = msgs[j]["id"]
-        if mid not in chart_map:
+    best, best_gap = None, None
+    for j in range(max(0, idx - 15), min(len(msgs), idx + 15)):
+        c = chartlike(msgs[j]["id"])
+        if not c:
             continue
         t = parse_ts(msgs[j]["timestamp"])
         if not (lo <= t <= hi):
             continue
         gap = abs((t - et).total_seconds())
         if best_gap is None or gap < best_gap:
-            best, best_gap = chart_map[mid], gap
+            best, best_gap = c, gap
     return best
 
 
@@ -800,6 +811,7 @@ def post_webhook(new_rows, status=""):
 # Main
 # --------------------------------------------------------------------------- #
 def run(dry=False):
+    log("  build: chart-pairing v3 (avatar-reject + neighbor-search + wide context)")
     state = load_state()
     scored = set(state["scored_ids"])
     chart_map = load_chart_map()
