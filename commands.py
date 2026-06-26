@@ -277,6 +277,49 @@ def cmd_flag(msg_id, **fields):
            + "\nApplied to all views and used as ground truth for `/validate`.", []
 
 
+def cmd_audit(msg_id=None):
+    """Show what the bot sees for an entry: its text, paired chart, and a LIVE
+    vision read. The fastest way to see why a trade did/didn't score."""
+    import vision_parse as V
+    msgs = load_messages()
+    if not msg_id:
+        traded = {r.get("msg_id") for r in A.load_rows()}
+        ents = [m for m in msgs if D.is_entry(m.get("text", "")) and m["id"] not in traded]
+        if not ents:
+            return "No recent un-scored entries to audit.", []
+        m = sorted(ents, key=lambda x: x.get("timestamp", ""))[-1]
+    else:
+        m = next((x for x in msgs if x["id"] == str(msg_id)), None)
+        if not m:
+            return f"Message `{msg_id}` not found in the store.", []
+
+    cmap = {}
+    try:
+        cmap = json.load(open(P("chart_map.json"), encoding="utf-8"))
+    except Exception:
+        pass
+    chart = cmap.get(m["id"])
+    chart_full = P(chart) if chart else None
+    exists = bool(chart_full and os.path.exists(chart_full))
+
+    out = [f"**Audit `{m['id']}`**  ({m.get('timestamp','')[:16]})",
+           f"detected as entry: {D.is_entry(m.get('text',''))}",
+           f"chart mapped: {chart or '—'}  | file present: {exists}",
+           "```", (m.get("text", "")[:300] or "(no text)"), "```"]
+
+    files = []
+    if exists:
+        files = [chart_full]
+        try:
+            v = V.read_chart(chart_full, m.get("text", "")[:600])
+            out.append("**live vision result:**\n```\n" + json.dumps(v, indent=1)[:700] + "\n```")
+        except Exception as e:
+            out.append(f"vision raised: {e}")
+    else:
+        out.append("_No chart file to read — that's why it didn't score._")
+    return "\n".join(out), files
+
+
 def _filter_label(instrument, direction):
     bits = []
     if instrument and instrument != "both":
