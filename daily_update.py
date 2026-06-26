@@ -725,9 +725,7 @@ def _strategy_stats(rows):
     """Return [(label, n, win%, net_R, avg_R), ...] for the four strategies plus
     his stated R. Shared by the text summary and the Discord embed."""
     out = []
-    labels = [("R_tp1_full_net", "TP1 full"), ("R_tp2_full_net", "TP2 full"),
-              ("R_tp1half_tp2_net", "TP1½+TP2"), ("R_trail_net", "Trailing"),
-              ("realized_R", "His realized")]
+    labels = [("R_tp1_full_net", "TP1 full"), ("realized_R", "His realized")]
     for col, name in labels:
         vals = [float(r[col]) for r in rows if r.get(col) not in ("", None)]
         if not vals:
