@@ -166,9 +166,12 @@ def text_report(rows):
 # --------------------------------------------------------------------------- #
 # Charts
 # --------------------------------------------------------------------------- #
+CURVE_BINS = ["R_tp1_full_net", "R_tp1half_tp2_net", "R_trail_net"]  # default equity lines
+
+
 def chart_equity(rows, cols=None, out_name="equity.png",
                  title="Cumulative R — equity curves", by_date=True):
-    cols = cols or list(STRATS.keys())
+    cols = cols or list(CURVE_BINS)
     plt.style.use("default")
     fig, ax = plt.subplots(figsize=(11, 5.2), dpi=130)
     plotted = False
@@ -203,44 +206,45 @@ def chart_equity(rows, cols=None, out_name="equity.png",
 
 def chart_dashboard(rows):
     fig, axs = plt.subplots(2, 2, figsize=(11, 8), dpi=130)
+    HEAD = "R_tp1_full_net"  # default headline strategy
 
-    # monthly net R (his realized) + win% overlay
-    m = grouped(rows, "realized_R", lambda d: d.strftime("%Y-%m"))
+    # monthly net R (TP1) + win% overlay
+    m = grouped(rows, HEAD, lambda d: d.strftime("%Y-%m"))
     months = list(m.keys())
     nets = [m[k][0] for k in months]
     wins = [m[k][1] for k in months]
     ax = axs[0, 0]
-    bars = ax.bar(months, nets, color=["#22c55e" if x >= 0 else "#ef4444" for x in nets])
-    ax.set_title("Monthly net R (his realized)", weight="bold", fontsize=11)
+    ax.bar(months, nets, color=["#22c55e" if x >= 0 else "#ef4444" for x in nets])
+    ax.set_title("Monthly net R (TP1 full)", weight="bold", fontsize=11)
     ax.axhline(0, color="#888", lw=0.8)
     ax.tick_params(axis="x", rotation=45, labelsize=8)
 
     ax = axs[0, 1]
     ax.plot(months, wins, marker="o", color="#3b82f6")
-    ax.set_title("Monthly win % (his realized)", weight="bold", fontsize=11)
+    ax.set_title("Monthly win % (TP1 full)", weight="bold", fontsize=11)
     ax.set_ylim(0, 100); ax.axhline(50, color="#888", lw=0.8, ls="--")
     ax.tick_params(axis="x", rotation=45, labelsize=8); ax.grid(True, alpha=0.25)
 
-    # by instrument net R across strategies
+    # by instrument: TP1 vs his realized — the ES/NQ cross-validation
     ax = axs[1, 0]
     instrs = sorted({r.get("instrument", "?") for r in rows} & {"ES", "NQ"})
     x = range(len(instrs))
-    for i, (col, name) in enumerate(list(STRATS.items())[:2] + [("realized_R", "His realized")]):
+    for i, (col, name) in enumerate([("R_tp1_full_net", "TP1 full"), ("realized_R", "His realized")]):
         sp = split(rows, col, "instrument")
-        ax.bar([xx + i * 0.25 for xx in x], [sp.get(k, (0,))[0] for k in instrs],
-               width=0.25, label=name, color=PALETTE[name])
-    ax.set_xticks([xx + 0.25 for xx in x]); ax.set_xticklabels(instrs)
-    ax.set_title("Net R by instrument", weight="bold", fontsize=11)
+        ax.bar([xx + i * 0.3 for xx in x], [sp.get(k, (0,))[0] for k in instrs],
+               width=0.3, label=name, color=PALETTE[name])
+    ax.set_xticks([xx + 0.15 for xx in x]); ax.set_xticklabels(instrs)
+    ax.set_title("Net R by instrument (cross-check)", weight="bold", fontsize=11)
     ax.axhline(0, color="#888", lw=0.8); ax.legend(fontsize=8)
 
-    # drawdown underwater (his realized)
+    # drawdown underwater (TP1)
     ax = axs[1, 1]
-    s = series(rows, "realized_R")
+    s = series(rows, HEAD)
     cum, peak, under, xs = 0.0, 0.0, [], []
     for dt, v in s:
         cum += v; peak = max(peak, cum); under.append(cum - peak); xs.append(dt)
     ax.fill_between(xs, under, 0, color="#ef4444", alpha=0.4)
-    ax.set_title("Drawdown underwater (his realized)", weight="bold", fontsize=11)
+    ax.set_title("Drawdown underwater (TP1 full)", weight="bold", fontsize=11)
     ax.set_ylabel("R below peak"); ax.grid(True, alpha=0.25)
     ax.tick_params(axis="x", rotation=45, labelsize=8)
 
