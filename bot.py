@@ -118,6 +118,12 @@ async def flag(interaction, msg_id: str, outcome_type: str = "", realized_r: str
     await _go(interaction, lambda: C.cmd_flag(msg_id, **kw))
 
 
+@tree.command(description="Inspect one entry: its text, chart, and live vision read")
+@app_commands.describe(msg_id="trade/message id (blank = most recent un-scored entry)")
+async def audit(interaction, msg_id: str = ""):
+    await _go(interaction, C.cmd_audit, msg_id or None)
+
+
 @tree.command(description="Run the pipeline now (fetch prices, score, post)")
 async def run(interaction):
     if not _auth(interaction):
